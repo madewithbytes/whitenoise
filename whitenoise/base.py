@@ -1,5 +1,6 @@
 from email.utils import formatdate
 import os
+import StringIO
 from posixpath import normpath
 from wsgiref.headers import Headers
 from wsgiref.util import FileWrapper
@@ -10,6 +11,12 @@ from .utils import (decode_if_byte_string, decode_path_info,
                     ensure_leading_trailing_slash, MissingFileError,
                     stat_regular_file)
 
+
+def _to_int(i):
+    try:
+        return int(i)
+    except ValueError, e:
+        raise e
 
 class WhiteNoise(object):
 
@@ -67,15 +74,57 @@ class WhiteNoise(object):
         else:
             return self.serve(static_file, environ, start_response)
 
+    def get_byte_range(self, range_value):
+        raw_b_start, raw_b_end = range_value.split('=')[1].split('-')
+        b_start = _to_int(raw_b_start)
+        b_end = None
+        if raw_b_end:
+            b_end = _to_int(raw_b_end)
+        if b_end and (not b_end > b_start):
+            raise ValueError('Invalid range')
+        return b_start, b_end
+
+    def get_partial_file(self, environ, request_file):
+        b_start, b_end = self.get_byte_range(environ['HTTP_RANGE'])
+        sbuffer = StringIO.StringIO()
+        request_file.seek(b_start)
+        if b_end is None:
+            # Read all the content
+            sbuffer.write(request_file.read())
+            b_end = request_file.tell() - 1
+        elif b_end >= b_start:
+            sbuffer.write(request_file.read(b_end - b_end + 1))
+        sbuffer.seek(0)
+        return sbuffer, (b_start, b_end)
+
+    def get_partial_headers(self, b_range, headers):
+        b_start, b_end = b_range
+        headers_dict = dict(headers)
+        original_size = headers_dict['Content-Length']
+        headers_dict['Content-Length'] = '%s' % (b_end - b_start + 1)
+        headers_dict['Accept-Ranges'] = 'bytes'
+        headers_dict['Content-Range'] = 'bytes %d-%d/%s' % (
+            b_start, b_end, original_size)
+        return [(k, v) for k, v in headers_dict.items()]
+
     def serve(self, static_file, environ, start_response):
         response = static_file.get_response(environ['REQUEST_METHOD'], environ)
         status_line = '{} {}'.format(response.status, response.status.phrase)
-        start_response(status_line, list(response.headers))
-        if response.file is not None:
+        if 'HTTP_RANGE' in environ:
+            partial_file, b_range = self.get_partial_file(
+                environ, response.file)
+            partial_headers = self.get_partial_headers(
+                b_range, response.headers)
+            start_response('206 Partial Content', list(partial_headers))
             file_wrapper = environ.get('wsgi.file_wrapper', FileWrapper)
-            return file_wrapper(response.file)
+            return file_wrapper(partial_file)
         else:
-            return []
+            start_response(status_line, list(response.headers))
+            if response.file is not None:
+                file_wrapper = environ.get('wsgi.file_wrapper', FileWrapper)
+                return file_wrapper(response.file)
+            else:
+                return []
 
     def add_files(self, root, prefix=None):
         root = decode_if_byte_string(root)
